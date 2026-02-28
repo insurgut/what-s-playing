@@ -19,7 +19,7 @@ import telethon
 from telethon import TelegramClient, functions, types, errors, events, utils
 from telethon.extensions import html
 from PIL import Image, ImageDraw
-from yandex_music import Client as YMClient
+LISURGUT_API = "https://lisurgut.ru"
 
 CFG = 'config.json'
 CV = 'covers_cache.json'
@@ -35,7 +35,6 @@ DEF_CFG = {
         "mid": 0,
         "cocid": 0,
         "comid": 0,
-        "pack_name": "music_covers_v1",
         "cmd": ".mul",
         "set_status": True,
         "off_status_emoji": "0",
@@ -56,9 +55,6 @@ DEF_CFG = {
     "lastfm": {
         "api_key": "",
         "username": ""
-    },
-    "yandex": {
-        "token": ""
     }
 }
 
@@ -129,7 +125,6 @@ while True:
 
 AID, AHS = c['telegram']['api_id'], c['telegram']['api_hash']
 cl = TelegramClient('session', AID, AHS)
-ym = YMClient(token=c['yandex']['token']) if c['yandex']['token'] else YMClient()
 
 mem = {
     'trk': None,
@@ -188,6 +183,21 @@ def parse_hybrid(txt: str):
 
     return text, entities
 
+def _shift_entity(ent, offset_delta):
+    cls = type(ent)
+    kwargs = {}
+    for field in ('offset', 'length', 'url', 'user_id', 'language', 'document_id', 'custom_emoji_id'):
+        if hasattr(ent, field):
+            val = getattr(ent, field)
+            if field == 'offset':
+                val += offset_delta
+            kwargs[field] = val
+    try:
+        return cls(**kwargs)
+    except Exception:
+        return cls(offset=ent.offset + offset_delta, length=ent.length)
+
+
 @cl.on(events.NewMessage(outgoing=True))
 async def h_cmd(e):
     cfg = ld_c()
@@ -199,33 +209,105 @@ async def h_cmd(e):
             await cl.forward_messages(e.chat_id, cfg['telegram']['mid'], cfg['telegram']['cid'])
         except Exception as x:
             lg("CMD", x)
-    elif e.text == '.test':
-        await e.edit("🔄 Check...", parse_mode='html')
-        p = cfg['telegram']['pack_name']
+    elif e.text.startswith('.find '):
+        query = e.text[6:].strip()
+        if not query:
+            await e.edit("❌ Укажи запрос: `.find artist - title`")
+            return
+        await e.edit("🔍 Ищу...")
         try:
-            s = await cl(functions.messages.GetStickerSetRequest(types.InputStickerSetShortName(p), 0))
-            if not s.documents:
-                await e.edit(f"❌ Empty: {p}")
+            r = requests.get(f"{LISURGUT_API}/api/search", params={"q": query, "limit": 8}, timeout=8).json()
+            tracks = r.get("tracks", [])
+            if not tracks:
+                await e.edit(f"😕 Ничего не найдено: `{query}`")
                 return
-            m = f"📦 {p}\n"
-            for d in s.documents[-3:]:
-                m += f"🆔 {d.id}: {{emoji:{d.id}}}\n"
-            t, en = parse_hybrid(m)
-            await e.edit(t, formatting_entities=en, link_preview=True)
+
+            cfg_now = ld_c()
+            pack_name = cfg_now['telegram']['pack_name']
+            cover_ids = []
+            added_docs = []
+            for t in tracks:
+                cover_url = t.get("cover")
+                doc_id = None
+                if cover_url:
+                    try:
+                        png = await _make_cover_png(cover_url)
+                        eid, input_doc = await _cover_to_emoji_id(png, pack_name)
+                        doc_id = eid
+                        added_docs.append(input_doc)
+                    except Exception as ce:
+                        lg("FIND_COVER_ERR", str(ce))
+                        doc_id = None
+                cover_ids.append(doc_id)
+
+            THUMB = "👾"
+            tw = len(THUMB.encode("utf-16-le")) // 2
+
+            header = f"🔍 {query}"
+            header_t, header_ents = parse_hybrid(header)
+
+            body_parts = []
+            body_ents_manual = []
+            cur_offset = 0
+
+            for idx, (t, doc_id) in enumerate(zip(tracks, cover_ids)):
+                link = f"{LISURGUT_API}/et?artist={urllib.parse.quote(t['artist'])}&title={urllib.parse.quote(t['title'])}"
+                line_text, line_ents = parse_hybrid(f"**{idx+1}.** [{t['artist']} — {t['title']}]({link})")
+
+                if doc_id:
+                    prefix = THUMB + " "
+                    full_line = prefix + line_text
+                    body_ents_manual.append(types.MessageEntityCustomEmoji(offset=cur_offset, length=tw, document_id=doc_id))
+                    for ent in line_ents:
+                        body_ents_manual.append(_shift_entity(ent, cur_offset + tw + 1))
+                else:
+                    full_line = line_text
+                    for ent in line_ents:
+                        body_ents_manual.append(_shift_entity(ent, cur_offset))
+
+                body_parts.append(full_line)
+                cur_offset += len(full_line.encode("utf-16-le")) // 2
+                if idx < len(tracks) - 1:
+                    body_parts.append("\n")
+                    cur_offset += 1
+
+            body_t = "".join(body_parts)
+            nl = "\n"
+            full_text = header_t + nl + body_t
+            offset_shift = len(header_t.encode("utf-16-le")) // 2 + 1
+
+            final_ents = list(header_ents)
+            for ent in body_ents_manual:
+                final_ents.append(_shift_entity(ent, offset_shift))
+
+            bq_length = len(body_t.encode("utf-16-le")) // 2
+            final_ents.append(types.MessageEntityBlockquote(offset=offset_shift, length=bq_length, collapsed=True))
+
+            await e.edit(full_text, formatting_entities=final_ents, link_preview=False)
+            for input_doc in added_docs:
+                try:
+                    await cl(functions.stickers.RemoveStickerFromSetRequest(sticker=input_doc))
+                except Exception:
+                    pass
         except Exception as x:
-            await e.edit(f"Err: {x}")
-    elif e.text.startswith('.em '):
-        try:
-            await e.delete()
-            t = "👾"
-            i = int(e.text.split()[1])
-            await cl.send_message(e.chat_id, t, formatting_entities=[types.MessageEntityCustomEmoji(0, u16(t), i)])
-        except:
-            pass
-    elif e.text == '.id':
-        await e.edit(f"✅ Chat ID for config: `{e.chat_id}`")
-
-
+            await e.edit(f"❌ Ошибка: {x}")
+    elif e.text == '.np':
+        cfg2 = ld_c()
+        trk = mem.get('trk')
+        cid2 = mem.get('cv_id')
+        if not trk:
+            await e.edit("🎵 Сейчас ничего не играет")
+            return
+        cover_part = f"{{emoji:{cid2}}} " if cid2 else ""
+        lnk = mem.get('lnk', {})
+        lis = lnk.get('lisurgut', '')
+        parts = trk.split(' - ', 1)
+        artist_np = parts[0] if len(parts) > 1 else trk
+        title_np = parts[1] if len(parts) > 1 else trk
+        link_txt = f" · [слушать]({lis})" if lis else ""
+        txt = f"{cover_part}**{artist_np}** — {title_np}{link_txt}"
+        t_parsed, ents = parse_hybrid(txt)
+        await e.edit(t_parsed, formatting_entities=ents, link_preview=False)
 def g_trk(cfg):
     try:
         if not cfg.get('lastfm', {}).get('username') or not cfg.get('lastfm', {}).get('api_key'):
@@ -248,34 +330,41 @@ def g_trk(cfg):
         return None
 
 
-def g_itu(q):
+def g_itu(artist, title):
     try:
-        lg("ITUNES_Q", q)
+        lg("API_COVER", f"{artist} - {title}")
         r = requests.get(
-            f"https://itunes.apple.com/search?term={urllib.parse.quote(q)}&entity=song&limit=1",
-            timeout=2
+            f"{LISURGUT_API}/et/api",
+            params={"artist": artist, "title": title},
+            timeout=5
         ).json()
-        if r.get('resultCount', 0) > 0 and r.get('results'):
-            url = r['results'][0]['artworkUrl100'].replace('100x100', '600x600')
-            lg("ITUNES_OK", url)
+        url = r.get("track", {}).get("cover_url")
+        if url:
+            lg("API_COVER_OK", url)
             return url
-        lg("ITUNES_EMPTY", "No results")
+        lg("API_COVER_EMPTY", "No cover in response")
     except Exception as e:
-        lg("ITUNES_ERR", e)
+        lg("API_COVER_ERR", e)
     return None
 
 
-def g_yam(q):
+def g_yam(artist, title):
     try:
-        lg("YAM_Q", q)
-        s = ym.search(q)
-        if s.best and s.best.type == 'track' and s.best.result:
-            url = "https://" + s.best.result.cover_uri.replace('%%', '400x400')
-            lg("YAM_OK", url)
-            return url
-        lg("YAM_EMPTY", "No best track")
+        lg("API_SEARCH", f"{artist} - {title}")
+        r = requests.get(
+            f"{LISURGUT_API}/api/search",
+            params={"q": f"{artist} - {title}", "limit": 1},
+            timeout=5
+        ).json()
+        tracks = r.get("tracks", [])
+        if tracks:
+            url = tracks[0].get("cover")
+            if url:
+                lg("API_SEARCH_COVER_OK", url)
+                return url
+        lg("API_SEARCH_EMPTY", "No results")
     except Exception as e:
-        lg("YAM_ERR", e)
+        lg("API_SEARCH_ERR", e)
     return None
 
 
@@ -284,28 +373,26 @@ def f_lnk(a, t):
     fn = f"{a} - {t}"
     lg("LINKS_GEN", f"Generating for: {fn}")
     try:
-        s = ym.search(fn)
-        track = s.best.result if s.best and s.best.type == 'track' else None
-        if track and track.albums:
-            try:
-                album_id = track.albums[0].id
-                url = f"https://music.yandex.ru/album/{album_id}/track/{track.id}"
-                d['yandex'] = url
-                lg("LINKS_YANDEX", f"Found: {url}")
-            except Exception as e:
-                lg("LINKS_YANDEX_ID_ERR", str(e))
-        else:
-            lg("LINKS_YANDEX", "No track/albums found")
+        r = requests.get(
+            f"{LISURGUT_API}/api/search",
+            params={"q": fn, "limit": 1},
+            timeout=5
+        ).json()
+        tracks = r.get("tracks", [])
+        if tracks:
+            tid = tracks[0].get("id")
+            if tid:
+                detail = requests.get(f"{LISURGUT_API}/api/track/{tid}", timeout=5).json()
+                mp3 = detail.get("mp3_url", "")
+                if "music.yandex.ru" in mp3 or detail.get("source") == "yandex":
+                    clean_id = tid.split("_")[-1] if "_" in str(tid) else tid
+                    d['yandex'] = f"https://music.yandex.ru/track/{clean_id}"
+                    lg("LINKS_YANDEX", d['yandex'])
     except Exception as e:
         lg("LINKS_YANDEX_ERR", str(e))
     try:
-        url = (
-            "https://lisurgut.ru/et"
-            f"?artist={urllib.parse.quote(a)}"
-            f"&title={urllib.parse.quote(t)}"
-        )
-        d['lisurgut'] = url
-        lg("LINKS_LISURGUT", f"Generated: {url}")
+        d['lisurgut'] = f"{LISURGUT_API}/et?artist={urllib.parse.quote(a)}&title={urllib.parse.quote(t)}"
+        lg("LINKS_LISURGUT", d['lisurgut'])
     except Exception as e:
         lg("LINKS_LISURGUT_ERR", str(e))
     lg("LINKS_RESULT", str(d))
@@ -316,7 +403,7 @@ def g_cld(k, cfg):
     if not cfg['telegram'].get('use_cloud', False):
         return None
     try:
-        r = requests.get("https://api.lisurgut.ru/et/s", timeout=3)
+        r = requests.get(f"{LISURGUT_API}/et/s", timeout=3)
         if r.status_code == 200:
             data = r.json()
             for item in data:
@@ -334,7 +421,7 @@ def s_cld(k, eid, cfg):
     if not cfg['telegram'].get('use_cloud', False):
         return
     try:
-        r = requests.post("https://api.lisurgut.ru/et/add", json={"track": k, "emoji_id": str(eid)}, timeout=5)
+        r = requests.post(f"{LISURGUT_API}/et/add", json={"track": k, "emoji_id": str(eid)}, timeout=5)
         lg("SCL", f"Add: {r.status_code}")
     except Exception as e:
         lg("SCL", f"Add ERR: {e}")
@@ -369,7 +456,9 @@ async def create_pack_via_bot(title, name, png_bytes):
             await conv.get_response()
             await conv.send_message(name)
             await conv.get_response()
-            upl = await cl.upload_file(png_bytes, file_name="s.png")
+            buf_bot = io.BytesIO(png_bytes)
+            buf_bot.name = "s.png"
+            upl = await cl.upload_file(buf_bot, file_name="s.png")
             await conv.send_file(upl, force_document=True)
             await conv.get_response()
             await conv.send_message("💿")
@@ -392,6 +481,69 @@ async def create_pack_via_bot(title, name, png_bytes):
         return False
 
 
+async def _make_cover_png(url):
+    raw = requests.get(url, timeout=10).content
+    img = Image.open(io.BytesIO(raw)).convert('RGBA').resize((100, 100), Image.Resampling.LANCZOS)
+    msk = Image.new('L', (100, 100), 0)
+    ImageDraw.Draw(msk).rounded_rectangle((0, 0, 100, 100), radius=25, fill=255)
+    img.putalpha(msk)
+    buf = io.BytesIO()
+    img.save(buf, 'PNG')
+    return buf.getvalue()
+
+
+async def _upload_sticker(png_bytes):
+    buf = io.BytesIO(png_bytes)
+    buf.name = 'cover.png'
+    uploaded = await cl.upload_file(buf, file_name='cover.png')
+    upl = await cl(functions.messages.UploadMediaRequest(
+        peer=types.InputPeerSelf(),
+        media=types.InputMediaUploadedDocument(
+            file=uploaded,
+            mime_type='image/png',
+            attributes=[types.DocumentAttributeFilename(file_name='cover.png')]
+        )
+    ))
+    return utils.get_input_document(upl.document)
+
+
+async def _cover_to_emoji_id(png_bytes, pack_name):
+    buf = io.BytesIO(png_bytes)
+    buf.name = 'cover.png'
+    uploaded = await cl.upload_file(buf, file_name='cover.png')
+    upl = await cl(functions.messages.UploadMediaRequest(
+        peer=types.InputPeerSelf(),
+        media=types.InputMediaUploadedDocument(
+            file=uploaded,
+            mime_type='image/png',
+            attributes=[types.DocumentAttributeFilename(file_name='cover.png')]
+        )
+    ))
+    di = utils.get_input_document(upl.document)
+    await cl(functions.stickers.AddStickerToSetRequest(
+        stickerset=types.InputStickerSetShortName(pack_name),
+        sticker=types.InputStickerSetItem(document=di, emoji='💿', keywords='cover')
+    ))
+    s = await cl(functions.messages.GetStickerSetRequest(types.InputStickerSetShortName(pack_name), 0))
+    return s.documents[-1].id, utils.get_input_document(s.documents[-1])
+
+
+async def _ensure_pack(pack, png_bytes):
+    try:
+        s = await cl(functions.messages.GetStickerSetRequest(types.InputStickerSetShortName(pack), 0))
+        return s, pack
+    except Exception:
+        pass
+    lg("PACK", f"Pack not found, creating: {pack}")
+    ok = await create_pack_via_bot(f"Music {pack}", pack, png_bytes)
+    if not ok:
+        return None, pack
+    await inst_p(pack)
+    await asyncio.sleep(2)
+    s = await cl(functions.messages.GetStickerSetRequest(types.InputStickerSetShortName(pack), 0))
+    return s, pack
+
+
 async def up_cv(u, k, cfg):
     cid = g_cld(k, cfg)
     if cid:
@@ -401,82 +553,29 @@ async def up_cv(u, k, cfg):
         lg("CV_CACHE", f"Hit: {k} -> {cv_c[k]}")
         return cv_c[k]
     lg("CV", f"Load: {u[:60]}...")
-    b = io.BytesIO()
     try:
-        i = Image.open(io.BytesIO(requests.get(u).content)).convert('RGBA').resize((100, 100), Image.Resampling.LANCZOS)
-        msk = Image.new('L', (100, 100), 0)
-        ImageDraw.Draw(msk).rounded_rectangle((0, 0, 100, 100), radius=25, fill=255)
-        i.putalpha(msk)
-        i.save(b, 'PNG')
-        b.seek(0)
-        b.name = "c.png"
-        png_bytes = b.getvalue()
-        if not os.path.exists('local_covers'):
-            os.makedirs('local_covers')
-        safe_k = "".join([c for c in k if c.isalpha() or c.isdigit() or c in (' ', '-')]).rstrip()
-        with open(os.path.join('local_covers', f'{safe_k}.png'), 'wb') as f:
-            f.write(png_bytes)
-        b.seek(0)
+        png_bytes = await _make_cover_png(u)
         pack = cfg['telegram']['pack_name']
-        try:
-            s = await cl(functions.messages.GetStickerSetRequest(types.InputStickerSetShortName(pack), 0))
-            lg("PACK_INFO", f"{pack}: {len(s.documents)} docs")
-            if len(s.documents) >= 100:
-                me = await cl.get_me()
-                rnd = ''.join(random.choices(string.ascii_letters, k=6))
-                np = f"em{me.id}_{rnd}"
-                lg("PACK", f"Full! Creating via Bot: {np}")
-                ok = await create_pack_via_bot(f"Music {np}", np, png_bytes)
-                if ok:
-                    c = ld_c()
-                    c['telegram']['pack_name'] = np
-                    sv_c(c)
-                    pack = np
-                    await inst_p(pack)
-                    s = await cl(functions.messages.GetStickerSetRequest(types.InputStickerSetShortName(pack), 0))
-                    nid = s.documents[0].id
-                    s_cld(k, nid, cfg)
-                    if cfg['telegram'].get('use_cache'):
-                        cv_c[k] = nid
-                        sv_cache()
-                    return nid
-                else:
-                    return None
-        except Exception as e:
-            lg("PACK_INFO_ERR", str(e))
-        tm = await cl.send_file('me', b, force_document=True,
-                                attributes=[types.DocumentAttributeFilename('c.png')])
-        di = utils.get_input_document(tm.media.document)
-        try:
-            await cl(functions.stickers.AddStickerToSetRequest(
-                types.InputStickerSetShortName(pack),
-                types.InputStickerSetItem(di, '💿', keywords='c')
-            ))
-        except errors.StickersetInvalidError:
-            me = await cl.get_me()
-            rnd = ''.join(random.choices(string.ascii_letters, k=6))
-            np = f"em{me.id}_{rnd}"
-            lg("PACK", f"Invalid! Creating via Bot: {np}")
-            ok = await create_pack_via_bot(f"Music {np}", np, png_bytes)
-            if ok:
-                c = ld_c()
-                c['telegram']['pack_name'] = np
-                sv_c(c)
-                pack = np
-                await inst_p(pack)
-                s = await cl(functions.messages.GetStickerSetRequest(types.InputStickerSetShortName(pack), 0))
-                nid = s.documents[0].id
-                s_cld(k, nid, cfg)
-                if cfg['telegram'].get('use_cache'):
-                    cv_c[k] = nid
-                    sv_cache()
-                await tm.delete()
-                return nid
-            await tm.delete()
+        s, pack = await _ensure_pack(pack, png_bytes)
+        if s is None:
             return None
-        await tm.delete()
-        await inst_p(pack)
-        await asyncio.sleep(2)
+
+        for doc in list(s.documents):
+            try:
+                await cl(functions.stickers.RemoveStickerFromSetRequest(
+                    sticker=utils.get_input_document(doc)
+                ))
+                lg("PACK_DEL", f"Removed old sticker {doc.id}")
+            except Exception as ex:
+                lg("PACK_DEL_ERR", str(ex))
+        await asyncio.sleep(1)
+
+        di = await _upload_sticker(png_bytes)
+        await cl(functions.stickers.AddStickerToSetRequest(
+            stickerset=types.InputStickerSetShortName(pack),
+            sticker=types.InputStickerSetItem(document=di, emoji='💿', keywords='cover')
+        ))
+        await asyncio.sleep(1)
         s = await cl(functions.messages.GetStickerSetRequest(types.InputStickerSetShortName(pack), 0))
         nid = s.documents[-1].id
         s_cld(k, nid, cfg)
@@ -575,7 +674,13 @@ async def main():
         await cl.start()
     except:
         sys.exit("❌ Auth")
+    me = await cl.get_me()
+    _pack_name = f"np{me.id}"
     cfg = ld_c()
+    if cfg['telegram'].get('pack_name', '') != _pack_name:
+        cfg['telegram']['pack_name'] = _pack_name
+        sv_c(cfg)
+        lg("PACK_NAME", f"Set pack name: {_pack_name}")
     cocid, comid = cfg['telegram'].get('cocid', 0), cfg['telegram'].get('comid', 0)
     initial_text = ""
     if cocid and comid:
@@ -606,7 +711,7 @@ async def main():
                 if mem['trk'] != fn:
                     lg("NP", fn)
                     mem['trk'] = fn
-                    im = g_itu(fn) or g_yam(fn)
+                    im = g_itu(c['art'], c['tit']) or g_yam(c['art'], c['tit'])
                     mem['cv_id'] = await up_cv(im, fn, cfg) if im else None
                     if not im:
                         lg("WARN", "No cover")
@@ -682,7 +787,6 @@ with cl:
 
 
 
-
 #              ▓███                  
 #            ░█████                  Привет брат, я рад что ты зашёл сюда, данный код был сделан на коленке под двумя
 #            ██████                  банками хмельного, пусть и так, но ты же этим заинтересовался, и я очень благодарен тебе! )
@@ -695,6 +799,4 @@ with cl:
 #                  ██████            ██ █ ███████ ██ █ ██ █████ █ ██████ ██████ █ █████ █ █ ████████ █ ███ █ ██ ██ █████ █ █ ████████ ██
 #                  █████▓            █ █ ███ █ █████ ██ ███ █ ███████ ███ █████ █ █████ ██ ███████ ████ █ ██ █ █ █ ████ █ ███ █████ ██ █
 #                  █████░            █ █████ ███ ███████ ██ ███ █ █████ █████ ███ █ █████ █ ██ █████ ██████ ██ ███ ████ ███ ███ ██████ █
-
-#                  ██▓░               
-
+#                  ██▓░
